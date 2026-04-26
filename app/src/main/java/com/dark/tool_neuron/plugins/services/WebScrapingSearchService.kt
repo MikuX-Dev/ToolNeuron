@@ -6,469 +6,419 @@ import com.dark.tool_neuron.models.plugins.SearchResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.jsoup.Jsoup
 import java.io.IOException
-import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
 /**
- * Google-scraping search service that replaces the broken DuckDuckGo endpoints.
+ * Multi-engine web search via HTML scraping.
  *
- * Strategy 1 (fast): HTTP GET google.com/search with mobile User-Agent, parse HTML
- * Strategy 2 (fallback): Lite Google search endpoint with different UA pool
+ * Engine priority (each is tried in order until results are found):
+ *   1. DuckDuckGo  — POST html.duckduckgo.com/html/  (most scraping-tolerant)
+ *   2. Bing        — GET bing.com/search              (stable selectors, low bot detection)
+ *   3. Brave       — GET search.brave.com/search      (independent index, relaxed scraping)
  *
- * Returns [DuckDuckGoSearchResponse] for drop-in compatibility with WebSearchPlugin.
+ * All engines return [DuckDuckGoSearchResponse] for drop-in compatibility.
  */
 class WebScrapingSearchService {
 
     companion object {
         private const val TAG = "WebScrapingSearch"
         private const val MAX_RETRIES = 2
-        private const val INITIAL_RETRY_DELAY_MS = 1500L
+        private const val RETRY_BASE_MS = 1000L
         private const val MIN_QUERY_LENGTH = 1
         private const val MAX_QUERY_LENGTH = 500
     }
 
-    // ── HTTP Client ──
+    // ─────────────────────────────────────────────────────────────────────────
+    // HTTP client — shared across all engines
+    // ─────────────────────────────────────────────────────────────────────────
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(true)
         .build()
 
-    // ── User-Agent Pools ──
+    // ─────────────────────────────────────────────────────────────────────────
+    // User-Agent pools — kept realistic and varied
+    // ─────────────────────────────────────────────────────────────────────────
 
-    private val mobileUserAgents = listOf(
-        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
-        "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1",
-        "Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/121.0.6167.171 Mobile/15E148 Safari/604.1"
+    private val desktopUAs = listOf(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     )
 
-    private val desktopUserAgents = listOf(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+    private val mobileUAs = listOf(
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
     )
 
-    // ── Public API ──
+    // ─────────────────────────────────────────────────────────────────────────
+    // Public API
+    // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Search the web by scraping Google results.
-     * Tries mobile Google first, falls back to desktop Google with different parsing.
-     */
     suspend fun search(
         query: String,
         maxResults: Int = 5,
         safeSearch: Boolean = true,
         @Suppress("UNUSED_PARAMETER") region: String? = null,
-        @Suppress("UNUSED_PARAMETER") timeRange: String? = null
+        @Suppress("UNUSED_PARAMETER") timeRange: String? = null,
     ): Result<DuckDuckGoSearchResponse> = withContext(Dispatchers.IO) {
-        val sanitized = sanitizeQuery(query)
-        if (sanitized.length < MIN_QUERY_LENGTH) {
-            return@withContext Result.failure(
-                IllegalArgumentException("Query too short (min $MIN_QUERY_LENGTH chars)")
-            )
-        }
-        if (sanitized.length > MAX_QUERY_LENGTH) {
-            return@withContext Result.failure(
-                IllegalArgumentException("Query too long (max $MAX_QUERY_LENGTH chars)")
-            )
-        }
 
-        val capped = maxResults.coerceIn(1, 10)
+        val q = sanitizeQuery(query)
+        if (q.length < MIN_QUERY_LENGTH)
+            return@withContext Result.failure(IllegalArgumentException("Query too short"))
+        if (q.length > MAX_QUERY_LENGTH)
+            return@withContext Result.failure(IllegalArgumentException("Query too long"))
 
-        // Strategy 1: Mobile Google HTML scrape
-        val mobileResult = scrapeGoogleMobile(sanitized, capped, safeSearch)
-        if (mobileResult.isSuccess) {
-            val response = mobileResult.getOrThrow()
-            if (response.results.isNotEmpty()) {
-                Log.d(TAG, "Mobile strategy returned ${response.results.size} results")
-                return@withContext Result.success(response)
+        val cap = maxResults.coerceIn(1, 10)
+
+        // ── Engine 1: DuckDuckGo ──────────────────────────────────────────
+        scrapeDuckDuckGo(q, cap, safeSearch).onSuccess { r ->
+            if (r.results.isNotEmpty()) {
+                Log.d(TAG, "DDG: ${r.results.size} results")
+                return@withContext Result.success(r)
             }
-        }
-        Log.w(TAG, "Mobile strategy failed: ${mobileResult.exceptionOrNull()?.message}")
+        }.onFailure { Log.w(TAG, "DDG failed: ${it.message}") }
 
-        // Small delay before fallback
-        delay(300 + Random.nextLong(0, 300))
+        delay(300 + Random.nextLong(200))
 
-        // Strategy 2: Desktop Google HTML scrape with different selectors
-        val desktopResult = scrapeGoogleDesktop(sanitized, capped, safeSearch)
-        if (desktopResult.isSuccess) {
-            val response = desktopResult.getOrThrow()
-            if (response.results.isNotEmpty()) {
-                Log.d(TAG, "Desktop strategy returned ${response.results.size} results")
-                return@withContext Result.success(response)
+        // ── Engine 2: Bing ────────────────────────────────────────────────
+        scrapeBing(q, cap, safeSearch).onSuccess { r ->
+            if (r.results.isNotEmpty()) {
+                Log.d(TAG, "Bing: ${r.results.size} results")
+                return@withContext Result.success(r)
             }
-        }
-        Log.w(TAG, "Desktop strategy failed: ${desktopResult.exceptionOrNull()?.message}")
+        }.onFailure { Log.w(TAG, "Bing failed: ${it.message}") }
 
-        Result.failure(
-            IOException("All Google search strategies failed for: $sanitized")
-        )
+        delay(300 + Random.nextLong(200))
+
+        // ── Engine 3: Brave ───────────────────────────────────────────────
+        scrapeBrave(q, cap, safeSearch).onSuccess { r ->
+            if (r.results.isNotEmpty()) {
+                Log.d(TAG, "Brave: ${r.results.size} results")
+                return@withContext Result.success(r)
+            }
+        }.onFailure { Log.w(TAG, "Brave failed: ${it.message}") }
+
+        Result.failure(IOException("All search engines failed for: $q"))
     }
 
-    // ── Strategy 1: Mobile Google ──
+    // ─────────────────────────────────────────────────────────────────────────
+    // Engine 1 — DuckDuckGo HTML (POST, most reliable)
+    // ─────────────────────────────────────────────────────────────────────────
 
-    private suspend fun scrapeGoogleMobile(
+    private suspend fun scrapeDuckDuckGo(
         query: String,
         maxResults: Int,
-        safeSearch: Boolean
+        safeSearch: Boolean,
     ): Result<DuckDuckGoSearchResponse> = withContext(Dispatchers.IO) {
-        var lastException: Exception? = null
-
+        var lastEx: Exception? = null
         repeat(MAX_RETRIES) { attempt ->
             try {
-                val startTime = System.currentTimeMillis()
-                val encoded = URLEncoder.encode(query, "UTF-8")
+                val t0 = System.currentTimeMillis()
 
-                val url = buildString {
-                    append("https://www.google.com/search?q=")
-                    append(encoded)
-                    append("&num=").append(maxResults + 2) // request extra to account for filtering
-                    append("&hl=en")
-                    if (safeSearch) append("&safe=active")
-                }
+                // DDG works much better via POST to its HTML endpoint
+                val body = FormBody.Builder()
+                    .add("q", query)
+                    .add("kl", "us-en")          // region
+                    .add("kp", if (safeSearch) "1" else "-2") // safe search
+                    .add("kaf", "1")              // no ads
+                    .build()
 
-                val request = Request.Builder()
-                    .url(url)
-                    .header("User-Agent", mobileUserAgents.random())
+                val req = Request.Builder()
+                    .url("https://html.duckduckgo.com/html/")
+                    .post(body)
+                    .header("User-Agent", desktopUAs.random())
                     .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
                     .header("Accept-Language", "en-US,en;q=0.9")
-                    .header("Accept-Encoding", "gzip, deflate")
+                    .header("Accept-Encoding", "gzip, deflate, br")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .header("Origin", "https://duckduckgo.com")
+                    .header("Referer", "https://duckduckgo.com/")
                     .header("DNT", "1")
-                    .header("Connection", "keep-alive")
-                    .header("Upgrade-Insecure-Requests", "1")
                     .build()
 
-                client.newCall(request).execute().use { response ->
-                    if (response.code == 429) {
-                        throw RateLimitException("Google rate limited (429)")
-                    }
-                    if (!response.isSuccessful) {
-                        throw IOException("HTTP ${response.code}: ${response.message}")
-                    }
-
-                    val html = response.body.string()
-
-                    if (isBlockedOrCaptcha(html)) {
-                        throw BlockedException("Google CAPTCHA / unusual traffic detected")
-                    }
-
-                    val results = parseGoogleResults(html, maxResults)
-                    val elapsed = System.currentTimeMillis() - startTime
-
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) throw IOException("DDG HTTP ${resp.code}")
+                    val html = resp.body.string()
+                    val results = parseDuckDuckGoHtml(html, maxResults)
                     return@withContext Result.success(
                         DuckDuckGoSearchResponse(
                             query = query,
                             results = results,
                             totalResults = results.size,
-                            searchTime = elapsed
+                            searchTime = System.currentTimeMillis() - t0,
                         )
                     )
                 }
             } catch (e: Exception) {
-                lastException = e
-                if (attempt < MAX_RETRIES - 1) {
-                    val backoff = INITIAL_RETRY_DELAY_MS * (1 shl attempt) + Random.nextLong(0, 1000)
-                    delay(backoff)
-                }
+                lastEx = e
+                if (attempt < MAX_RETRIES - 1)
+                    delay(RETRY_BASE_MS * (1 shl attempt) + Random.nextLong(500))
             }
         }
-
-        Result.failure(lastException ?: IOException("Mobile Google scrape failed"))
+        Result.failure(lastEx ?: IOException("DDG unknown failure"))
     }
 
-    // ── Strategy 2: Desktop Google ──
-
-    private suspend fun scrapeGoogleDesktop(
-        query: String,
-        maxResults: Int,
-        safeSearch: Boolean
-    ): Result<DuckDuckGoSearchResponse> = withContext(Dispatchers.IO) {
-        var lastException: Exception? = null
-
-        repeat(MAX_RETRIES) { attempt ->
-            try {
-                val startTime = System.currentTimeMillis()
-                val encoded = URLEncoder.encode(query, "UTF-8")
-
-                val url = buildString {
-                    append("https://www.google.com/search?q=")
-                    append(encoded)
-                    append("&num=").append(maxResults + 2)
-                    append("&hl=en")
-                    if (safeSearch) append("&safe=active")
-                }
-
-                val request = Request.Builder()
-                    .url(url)
-                    .header("User-Agent", desktopUserAgents.random())
-                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-                    .header("Accept-Language", "en-US,en;q=0.9")
-                    .header("Accept-Encoding", "gzip, deflate")
-                    .header("DNT", "1")
-                    .header("Connection", "keep-alive")
-                    .header("Upgrade-Insecure-Requests", "1")
-                    .header("Sec-Fetch-Dest", "document")
-                    .header("Sec-Fetch-Mode", "navigate")
-                    .header("Sec-Fetch-Site", "none")
-                    .build()
-
-                client.newCall(request).execute().use { response ->
-                    if (response.code == 429) {
-                        throw RateLimitException("Google rate limited (429)")
-                    }
-                    if (!response.isSuccessful) {
-                        throw IOException("HTTP ${response.code}: ${response.message}")
-                    }
-
-                    val html = response.body.string()
-
-                    if (isBlockedOrCaptcha(html)) {
-                        throw BlockedException("Google CAPTCHA / unusual traffic detected")
-                    }
-
-                    val results = parseGoogleResults(html, maxResults)
-                    val elapsed = System.currentTimeMillis() - startTime
-
-                    return@withContext Result.success(
-                        DuckDuckGoSearchResponse(
-                            query = query,
-                            results = results,
-                            totalResults = results.size,
-                            searchTime = elapsed
-                        )
-                    )
-                }
-            } catch (e: Exception) {
-                lastException = e
-                if (attempt < MAX_RETRIES - 1) {
-                    val backoff = INITIAL_RETRY_DELAY_MS * (1 shl attempt) + Random.nextLong(0, 500)
-                    delay(backoff)
-                }
-            }
-        }
-
-        Result.failure(lastException ?: IOException("Desktop Google scrape failed"))
-    }
-
-    // ── HTML Parsing ──
-
-    /**
-     * Parse Google search result HTML using Jsoup.
-     * Tries multiple selector strategies because Google changes its markup frequently.
-     */
-    private fun parseGoogleResults(html: String, maxResults: Int): List<SearchResult> {
+    private fun parseDuckDuckGoHtml(html: String, max: Int): List<SearchResult> {
         val results = mutableListOf<SearchResult>()
-        val seenUrls = mutableSetOf<String>()
-
+        val seen = mutableSetOf<String>()
         try {
             val doc = Jsoup.parse(html)
 
-            // Strategy A: Standard result divs with <h3> headings
-            val resultDivs = doc.select("div.g, div[data-hveid] div.g, div.Gx5Zad, div.tF2Cxc")
-            for (div in resultDivs) {
-                if (results.size >= maxResults) break
+            // DDG HTML layout: each result is <div class="result results_links ...">
+            // Title  : <a class="result__a" href="...">
+            // Snippet: <a class="result__snippet">  or  <div class="result__body">
+            val items = doc.select("div.result.results_links, div.result.results_links_deep")
+            for (item in items) {
+                if (results.size >= max) break
 
-                val heading = div.selectFirst("h3") ?: continue
-                val title = heading.text().trim()
-                if (title.isBlank() || title.length < 3) continue
+                val anchor = item.selectFirst("a.result__a") ?: continue
+                val title = anchor.text().trim()
+                if (title.isBlank()) continue
 
-                val url = extractGoogleUrl(div) ?: continue
-                if (url in seenUrls) continue
-                seenUrls.add(url)
+                // DDG wraps the real URL in a redirect — the data-href or href attr
+                // has the actual URL directly (unlike Google)
+                val href = anchor.attr("href").trim()
+                val url = when {
+                    href.startsWith("http") -> href
+                    href.startsWith("//") -> "https:$href"
+                    else -> continue   // relative or empty — skip
+                }
+                if (url in seen) continue
+                seen.add(url)
 
-                val snippet = extractSnippet(div)
+                val snippet = item.selectFirst("a.result__snippet")?.text()?.trim()
+                    ?: item.selectFirst("div.result__body")?.text()?.trim()
+                    ?: ""
 
-                results.add(
-                    SearchResult(
-                        title = title,
-                        snippet = snippet,
-                        url = url,
-                        position = results.size + 1
-                    )
-                )
+                results.add(SearchResult(title, snippet, url, results.size + 1))
             }
 
-            // Strategy B: Find all <h3> tags and walk up to parent link
+            // Fallback: older DDG layout uses <div class="links_main links_deep result__body">
             if (results.isEmpty()) {
-                val headings = doc.select("h3")
-                for (h3 in headings) {
-                    if (results.size >= maxResults) break
-
-                    val title = h3.text().trim()
-                    if (title.isBlank() || title.length < 3) continue
-
-                    // Walk up to find enclosing <a>
-                    val link = h3.closest("a")
-                        ?: h3.parent()?.selectFirst("a[href]")
-                        ?: continue
-
-                    val rawHref = link.attr("href")
-                    val url = resolveGoogleHref(rawHref) ?: continue
-                    if (url in seenUrls) continue
-                    seenUrls.add(url)
-
-                    // Snippet: look at the sibling/parent container
-                    val container = h3.closest("div[class]") ?: h3.parent()
-                    val snippet = container?.let { extractSnippet(it) } ?: ""
-
-                    results.add(
-                        SearchResult(
-                            title = title,
-                            snippet = snippet,
-                            url = url,
-                            position = results.size + 1
-                        )
-                    )
+                val fallbackItems = doc.select("div.links_main")
+                for (item in fallbackItems) {
+                    if (results.size >= max) break
+                    val a = item.selectFirst("a[href]") ?: continue
+                    val title = a.text().trim().ifBlank { continue }
+                    val href = a.attr("href").takeIf { it.startsWith("http") } ?: continue
+                    if (href in seen) continue
+                    seen.add(href)
+                    val snippet = item.selectFirst("a.result__snippet, span.result__snippet")
+                        ?.text()?.trim() ?: ""
+                    results.add(SearchResult(title, snippet, href, results.size + 1))
                 }
             }
-
-            // Strategy C: Broad fallback -- any <a> with /url?q= hrefs
-            if (results.isEmpty()) {
-                val links = doc.select("a[href*=/url?q=]")
-                for (link in links) {
-                    if (results.size >= maxResults) break
-
-                    val rawHref = link.attr("href")
-                    val url = resolveGoogleHref(rawHref) ?: continue
-                    if (url in seenUrls) continue
-
-                    val title = link.text().trim()
-                    if (title.isBlank() || title.length < 5) continue
-
-                    // Skip Google-internal pages
-                    if (url.contains("google.com/") || url.contains("accounts.google")) continue
-
-                    seenUrls.add(url)
-
-                    results.add(
-                        SearchResult(
-                            title = title,
-                            snippet = "",
-                            url = url,
-                            position = results.size + 1
-                        )
-                    )
-                }
-            }
-
         } catch (e: Exception) {
-            Log.w(TAG, "Error parsing Google HTML: ${e.message}")
+            Log.w(TAG, "DDG parse error: ${e.message}")
         }
-
         return results
     }
 
-    /**
-     * Extract a clean URL from a Google result div.
-     */
-    private fun extractGoogleUrl(div: org.jsoup.nodes.Element): String? {
-        // Try <a> with href containing /url?q=
-        val redirectLink = div.selectFirst("a[href*=/url?q=]")
-        if (redirectLink != null) {
-            val resolved = resolveGoogleHref(redirectLink.attr("href"))
-            if (resolved != null) return resolved
-        }
+    // ─────────────────────────────────────────────────────────────────────────
+    // Engine 2 — Bing (GET, stable DOM structure)
+    // ─────────────────────────────────────────────────────────────────────────
 
-        // Try plain <a href="https://...">
-        val plainLink = div.selectFirst("a[href^=https://], a[href^=http://]")
-        if (plainLink != null) {
-            val href = plainLink.attr("href")
-            if (!href.contains("google.com/") && !href.contains("accounts.google")) {
-                return href
+    private suspend fun scrapeBing(
+        query: String,
+        maxResults: Int,
+        safeSearch: Boolean,
+    ): Result<DuckDuckGoSearchResponse> = withContext(Dispatchers.IO) {
+        var lastEx: Exception? = null
+        repeat(MAX_RETRIES) { attempt ->
+            try {
+                val t0 = System.currentTimeMillis()
+                val encoded = URLEncoder.encode(query, "UTF-8")
+                val safe = if (safeSearch) "Moderate" else "Off"
+                val url = "https://www.bing.com/search?q=$encoded&count=${maxResults + 3}&setlang=en&safeSearch=$safe"
+
+                val req = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", desktopUAs.random())
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .header("Accept-Encoding", "gzip, deflate, br")
+                    .header("DNT", "1")
+                    .header("Connection", "keep-alive")
+                    .build()
+
+                client.newCall(req).execute().use { resp ->
+                    if (resp.code == 429) throw RateLimitException("Bing rate limited")
+                    if (!resp.isSuccessful) throw IOException("Bing HTTP ${resp.code}")
+                    val html = resp.body.string()
+                    val results = parseBingHtml(html, maxResults)
+                    return@withContext Result.success(
+                        DuckDuckGoSearchResponse(
+                            query = query,
+                            results = results,
+                            totalResults = results.size,
+                            searchTime = System.currentTimeMillis() - t0,
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                lastEx = e
+                if (attempt < MAX_RETRIES - 1)
+                    delay(RETRY_BASE_MS * (1 shl attempt) + Random.nextLong(500))
             }
         }
-
-        return null
+        Result.failure(lastEx ?: IOException("Bing unknown failure"))
     }
 
-    /**
-     * Resolve a Google redirect href (/url?q=...) to the target URL.
-     */
-    private fun resolveGoogleHref(rawHref: String): String? {
-        return try {
-            when {
-                rawHref.contains("/url?q=") -> {
-                    val encoded = rawHref.substringAfter("/url?q=").substringBefore("&")
-                    val decoded = URLDecoder.decode(encoded, "UTF-8")
-                    if (decoded.startsWith("http") && !decoded.contains("google.com/")) decoded else null
-                }
-                rawHref.startsWith("http") && !rawHref.contains("google.com/") -> rawHref
-                else -> null
+    private fun parseBingHtml(html: String, max: Int): List<SearchResult> {
+        val results = mutableListOf<SearchResult>()
+        val seen = mutableSetOf<String>()
+        try {
+            val doc = Jsoup.parse(html)
+
+            // Bing result structure (stable since ~2020):
+            //   <li class="b_algo">
+            //     <h2><a href="https://...">Title</a></h2>
+            //     <div class="b_caption"><p>Snippet text</p></div>
+            val items = doc.select("li.b_algo")
+            for (item in items) {
+                if (results.size >= max) break
+
+                val h2 = item.selectFirst("h2") ?: continue
+                val a = h2.selectFirst("a[href]") ?: continue
+                val title = a.text().trim().ifBlank { continue }
+
+                val href = a.attr("href").trim()
+                if (!href.startsWith("http")) continue
+                if (href in seen) continue
+                seen.add(href)
+
+                val snippet = item.selectFirst("div.b_caption p, div.b_algoSlug, p.b_lineclamp2")
+                    ?.text()?.trim() ?: ""
+
+                results.add(SearchResult(title, snippet, href, results.size + 1))
             }
         } catch (e: Exception) {
-            null
+            Log.w(TAG, "Bing parse error: ${e.message}")
         }
+        return results
     }
 
-    /**
-     * Extract snippet text from a result container.
-     */
-    private fun extractSnippet(container: org.jsoup.nodes.Element): String {
-        // Try common snippet selectors
-        val selectors = listOf(
-            "div.VwiC3b", "span.st", "div[data-sncf]", "div.IsZvec",
-            "div.s", "span.aCOpRe"
-        )
-        for (sel in selectors) {
-            val el = container.selectFirst(sel)
-            if (el != null) {
-                val text = el.text().trim()
-                if (text.length > 15) return cleanText(text)
+    // ─────────────────────────────────────────────────────────────────────────
+    // Engine 3 — Brave Search (GET, independent index, lax bot detection)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private suspend fun scrapeBrave(
+        query: String,
+        maxResults: Int,
+        safeSearch: Boolean,
+    ): Result<DuckDuckGoSearchResponse> = withContext(Dispatchers.IO) {
+        var lastEx: Exception? = null
+        repeat(MAX_RETRIES) { attempt ->
+            try {
+                val t0 = System.currentTimeMillis()
+                val encoded = URLEncoder.encode(query, "UTF-8")
+                val safe = if (safeSearch) "moderate" else "off"
+                val url = "https://search.brave.com/search?q=$encoded&count=${maxResults + 3}&lang=en&safesearch=$safe&source=web"
+
+                val req = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", mobileUAs.random()) // mobile UA avoids some JS walls on Brave
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .header("Accept-Encoding", "gzip, deflate, br")
+                    .header("DNT", "1")
+                    .build()
+
+                client.newCall(req).execute().use { resp ->
+                    if (resp.code == 429) throw RateLimitException("Brave rate limited")
+                    if (!resp.isSuccessful) throw IOException("Brave HTTP ${resp.code}")
+                    val html = resp.body.string()
+                    val results = parseBraveHtml(html, maxResults)
+                    return@withContext Result.success(
+                        DuckDuckGoSearchResponse(
+                            query = query,
+                            results = results,
+                            totalResults = results.size,
+                            searchTime = System.currentTimeMillis() - t0,
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                lastEx = e
+                if (attempt < MAX_RETRIES - 1)
+                    delay(RETRY_BASE_MS * (1 shl attempt) + Random.nextLong(500))
             }
         }
+        Result.failure(lastEx ?: IOException("Brave unknown failure"))
+    }
 
-        // Fallback: grab all <span> text that looks like a snippet
-        val spans = container.select("span")
-        for (span in spans) {
-            val text = span.text().trim()
-            if (text.length > 40 && !text.contains("http")) {
-                return cleanText(text.take(300))
+    private fun parseBraveHtml(html: String, max: Int): List<SearchResult> {
+        val results = mutableListOf<SearchResult>()
+        val seen = mutableSetOf<String>()
+        try {
+            val doc = Jsoup.parse(html)
+
+            // Brave result structure:
+            //   <div class="snippet fdb"> or <div class="snippet">
+            //     <a class="heading-serpresult" href="https://...">
+            //       <span class="title">Title</span>
+            //     </a>
+            //     <div class="snippet-description">Snippet</div>
+            val items = doc.select("div.snippet[data-type=web], div.snippet.fdb")
+            for (item in items) {
+                if (results.size >= max) break
+
+                val a = item.selectFirst("a[href^=https]") ?: continue
+                val title = (item.selectFirst("span.title, .title") ?: a).text().trim()
+                if (title.isBlank()) continue
+
+                val href = a.attr("href").trim()
+                if (href in seen) continue
+                seen.add(href)
+
+                val snippet = item.selectFirst("div.snippet-description, p.snippet-description")
+                    ?.text()?.trim() ?: ""
+
+                results.add(SearchResult(title, snippet, href, results.size + 1))
             }
+
+            // Fallback: generic heading + URL pattern in Brave's SSR output
+            if (results.isEmpty()) {
+                doc.select("a[href^=https]").forEach { a ->
+                    if (results.size >= max) return@forEach
+                    val href = a.attr("href")
+                    if (href.contains("brave.com") || href in seen) return@forEach
+                    val title = a.text().trim()
+                    if (title.length < 10) return@forEach
+                    seen.add(href)
+                    results.add(SearchResult(title, "", href, results.size + 1))
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Brave parse error: ${e.message}")
         }
-
-        return ""
+        return results
     }
 
-    // ── Utilities ──
+    // ─────────────────────────────────────────────────────────────────────────
+    // Utilities
+    // ─────────────────────────────────────────────────────────────────────────
 
-    private fun sanitizeQuery(query: String): String {
-        return query
-            .trim()
-            .replace(Regex("\\s+"), " ")
-            .replace(Regex("[\\x00-\\x1F\\x7F]"), "")
-    }
+    private fun sanitizeQuery(query: String) = query
+        .trim()
+        .replace(Regex("\\s+"), " ")
+        .replace(Regex("[\\x00-\\x1F\\x7F]"), "")
 
-    private fun isBlockedOrCaptcha(html: String): Boolean {
-        val lower = html.lowercase()
-        return lower.contains("unusual traffic") ||
-                lower.contains("captcha") ||
-                lower.contains("sorry/index") ||
-                lower.contains("recaptcha") ||
-                (html.length < 500 && lower.contains("blocked"))
-    }
-
-    private fun cleanText(text: String): String {
-        return text
-            .replace(Regex("<[^>]+>"), "")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-    }
-
-    // ── Custom Exceptions ──
-
-    private class RateLimitException(message: String) : IOException(message)
-    private class BlockedException(message: String) : IOException(message)
+    private class RateLimitException(msg: String) : IOException(msg)
 }
