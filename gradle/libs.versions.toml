@@ -32,7 +32,7 @@ poi = "5.5.1"
 retrofit = "3.0.0"
 slf4j-android = "1.7.36"
 xz = "1.12"
-onnxruntime-android = "1.25.0"
+onnxruntime-android = "1.25.1"
 coil = "3.4.0"
 
 androidx-espresso-core = "3.7.0"
